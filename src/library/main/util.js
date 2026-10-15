@@ -112,6 +112,10 @@ export class Util {
         });
     }
 
+    static isMixStream2Url(url) {
+        return typeof url === "string" && /mix-stream2\.mpd(?:$|[?#])/i.test(url);
+    }
+
     static getManifestType(text) {
         const lower = text.toLowerCase();
         if (lower.includes('<mpd') && lower.includes('</mpd>')) {

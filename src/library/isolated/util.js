@@ -6,6 +6,10 @@ export class Util {
         encode: b => btoa(String.fromCharCode(...new Uint8Array(b)))
     };
 
+    static isMixStream2Url(url) {
+        return typeof url === "string" && /mix-stream2\.mpd(?:$|[?#])/i.test(url);
+    }
+
     static readWidevineDevice(b64Data) {
         const data = Util.b64.decode(b64Data);
         const deviceType = data[4];

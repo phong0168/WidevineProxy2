@@ -206,10 +206,20 @@ async function refreshEmeStatuses(tabId) {
     });
 }
 
+function resetEmeStatusUi() {
+    drmStatusEl.querySelectorAll(".drm-step").forEach((cell) => {
+        setEmeStatusField(cell, null);
+    });
+}
+
 function listenEmeStatus(tabId) {
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (sender.tab?.id !== tabId)
             return;
+        if (message.type === "EME_STATUS_RESET") {
+            resetEmeStatusUi();
+            return;
+        }
         if (message.type !== "EME_STATUS_REACTIVE")
             return;
 

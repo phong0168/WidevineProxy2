@@ -4,6 +4,31 @@ const handlers = new Map();
 const manifestUrls = new Map();
 const manifestHeaders = new Map();
 const emeStatuses = {};
+const seenMixStream2Urls = new Set();
+
+function resetEmeStatuses(url) {
+    for (const key of Object.keys(emeStatuses)) {
+        delete emeStatuses[key];
+    }
+    console.log("[WVP2]", "mix-stream2.mpd captured, resetting DRM status", url);
+    try {
+        chrome.runtime.sendMessage({
+            type: "EME_STATUS_RESET",
+            payload: { url }
+        }, () => {
+            void chrome.runtime.lastError;
+        });
+    } catch (e) {
+        // popup may be closed
+    }
+}
+
+function maybeResetDrmStatus(url) {
+    if (!Util.isMixStream2Url(url) || seenMixStream2Urls.has(url))
+        return;
+    seenMixStream2Urls.add(url);
+    resetEmeStatuses(url);
+}
 
 function onMessage(type, handler) {
     handlers.set(type, handler);
@@ -52,6 +77,8 @@ onMessage("SETTINGS", async _ => {
 onMessage("MANIFEST_URL", async (data) => {
     const { url, tab_url } = data;
     delete data.tab_url;
+
+    maybeResetDrmStatus(url);
 
     if (!manifestUrls.has(tab_url)) {
         manifestUrls.set(tab_url, [data]);
@@ -144,6 +171,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "MANIFEST_HEADERS") {
         const { url, headers } = message.payload;
         manifestHeaders.set(url, headers);
+        maybeResetDrmStatus(url);
     } else if (message.type === "EME_STATUS_ACTIVE") {
         if (Object.keys(emeStatuses).length > 0) {
             sendResponse(emeStatuses);
