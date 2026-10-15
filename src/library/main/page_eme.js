@@ -46,6 +46,51 @@ function parseServerCert(cert) {
     return `Provider ID: ${drmCert.providerId}, Created: ${createdDate.toISOString()}`;
 }
 
+async function ensureSettings() {
+    if (settings && settings.device_type)
+        return settings;
+    settings = await Util.emit("SETTINGS", null);
+    return settings;
+}
+
+function isMediaKeySession(obj) {
+    return !!obj && typeof MediaKeySession !== "undefined" && (
+        obj instanceof MediaKeySession || MediaKeySession.prototype.isPrototypeOf(obj)
+    );
+}
+
+async function bufferToUint8Array(data) {
+    if (data == null)
+        throw new Error("Empty license payload");
+    if (typeof Blob !== "undefined" && data instanceof Blob)
+        data = await data.arrayBuffer();
+    if (data instanceof ArrayBuffer)
+        return new Uint8Array(data);
+    if (data instanceof Uint8Array)
+        return data;
+    if (ArrayBuffer.isView(data))
+        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if (typeof data === "string") {
+        try {
+            return Util.b64.decode(data);
+        } catch (e) {
+            return Util.utf8.encode(data);
+        }
+    }
+    return new Uint8Array(data);
+}
+
+async function handleLicenseUpdate(license, mediaKeySession) {
+    const bytes = await bufferToUint8Array(license);
+    try {
+        parseClearKeyResponse(bytes);
+        return;
+    } catch (e) {
+        // not ClearKey
+    }
+    await parseWidevineChallenge(bytes, mediaKeySession);
+}
+
 async function parseWidevineChallenge(license, mediaKeySession) {
     const licenseBytes = new Uint8Array(license);
 
@@ -54,6 +99,10 @@ async function parseWidevineChallenge(license, mediaKeySession) {
     try {
         signedMessage = SignedMessage.decode(licenseBytes);
     } catch (e) {
+        Util.emit("EME_LICENSE", {
+            success: false,
+            args: "Failed to decode license: " + (e?.message || String(e))
+        });
         return;
     }
 
@@ -101,6 +150,11 @@ async function parseWidevineChallenge(license, mediaKeySession) {
         const serverCert = new Uint8Array(signedMessage.msg);
         console.log("[WVP2]", frameId, "Server Cert (message):", parseServerCert(serverCert));
         sessionServerCertMap.set(mediaKeySession, serverCert);
+    } else {
+        Util.emit("EME_LICENSE", {
+            success: false,
+            args: "Unexpected SignedMessage type: " + signedMessage.type
+        });
     }
 }
 
@@ -246,20 +300,38 @@ if (typeof MediaKeySession !== "undefined") {
                 // ignored
             }
 
-            if (settings.device_type === "WVD") {
+            await ensureSettings();
+
+            if (settings?.device_type === "WVD") {
                 return getWidevineChallengeLocal(message, serverCert);
-            } else if (settings.device_type === "REMOTE") {
+            } else if (settings?.device_type === "REMOTE") {
                 return await getLicenseChallengeRemote(message, serverCert);
             }
             return message;
         };
 
+        const patchChallengeMessage = (e, newChallenge) => {
+            const buffer = new Uint8Array(newChallenge).buffer;
+            try {
+                Object.defineProperty(e, "message", {
+                    configurable: true,
+                    get: () => buffer
+                });
+                return true;
+            } catch (err) {
+                return false;
+            }
+        };
+
         const interceptChallenge = async (_args, _this, _thisTarget, type) => {
             const [e] = _args;
 
-            if (!(e instanceof MediaKeyMessageEvent) || !e.isTrusted || e.message.byteLength <= 2) {
+            if (!(e instanceof MediaKeyMessageEvent) || e.message.byteLength <= 2) {
                 return;
             }
+            // Synthetic clones are untrusted; still deliver them to the player.
+            if (!e.isTrusted)
+                return;
 
             Util.emit("EME_LICENSE_REQUEST", {
                 success: true,
@@ -274,43 +346,71 @@ if (typeof MediaKeySession !== "undefined") {
             }
 
             console.log("[WVP2]", "New challenge:", Util.b64.encode(newChallenge));
-            console.log("[WVP2]", frameId, `Intercepted (${settings.proxy_mode}/${type})`, _args[0]);
+            console.log("[WVP2]", frameId, `Intercepted (${settings?.proxy_mode}/${type})`, _args[0]);
 
-            if (settings.proxy_mode === "property") {
-                Object.defineProperty(e, "message", {
-                    configurable: true,
-                    get: () => new Uint8Array(newChallenge).buffer
-                });
-            } else if (settings.proxy_mode === "event") {
+            const patched = patchChallengeMessage(e, newChallenge);
+
+            // Keep the original trusted event so players that check isTrusted still
+            // send the license request. Cloning alone left License stuck on Challenge.
+            if (patched)
+                return false;
+
+            if (settings?.proxy_mode === "event") {
                 const clonedEvent = new MediaKeyMessageEvent("message", {
                     messageType: e.messageType,
                     message: new Uint8Array(newChallenge).buffer
                 });
 
-                e.stopImmediatePropagation();
-                e.preventDefault();
+                try {
+                    e.stopImmediatePropagation();
+                    e.preventDefault();
+                } catch (err) {}
 
                 _thisTarget.dispatchEvent(clonedEvent);
                 return true;
-                // true = we stop here because the dispatched event above will trigger the handler on its own
             }
         }
 
+        const wrappedListeners = new WeakMap();
+
         const wrapListener = (listener, _thisTarget) => {
+            if (!listener)
+                return listener;
+            if (wrappedListeners.has(listener))
+                return wrappedListeners.get(listener);
+
+            let wrapped = listener;
             if (typeof listener === "function") {
-                return new Proxy(listener, {
+                wrapped = new Proxy(listener, {
                     async apply(_target, _this, _args) {
-                        if (!(await interceptChallenge(_args, _this, _thisTarget, "function")))
+                        let skip = false;
+                        try {
+                            skip = await interceptChallenge(_args, _this, _thisTarget, "function");
+                        } catch (err) {
+                            console.error("[WVP2]", frameId, "Challenge intercept failed:", err);
+                        }
+                        if (!skip)
                             return Reflect.apply(_target, _this, _args);
                     }
                 });
             } else if (typeof listener === "object" && typeof listener.handleEvent === "function") {
                 Util.proxy(listener, "handleEvent", async (_target, _this, _args) => {
-                    if (!(await interceptChallenge(_args, _this, _thisTarget, "object")))
+                    let skip = false;
+                    try {
+                        skip = await interceptChallenge(_args, _this, _thisTarget, "object");
+                    } catch (err) {
+                        console.error("[WVP2]", frameId, "Challenge intercept failed:", err);
+                    }
+                    if (!skip)
                         return Reflect.apply(_target, _this, _args);
                 });
+                wrapped = listener;
             }
-            return listener;
+
+            wrappedListeners.set(listener, wrapped);
+            if (wrapped !== listener)
+                wrappedListeners.set(wrapped, wrapped);
+            return wrapped;
         }
 
         Util.proxy(MediaKeySession.prototype, "addEventListener", (_target, _this, _args) => {
@@ -324,23 +424,56 @@ if (typeof MediaKeySession !== "undefined") {
 
             return _target.apply(_this, _args);
         });
+
+        if (typeof EventTarget !== "undefined") {
+            Util.proxy(EventTarget.prototype, "addEventListener", (_target, _this, _args) => {
+                const [type, listener] = _args;
+                if (type === "message" && isMediaKeySession(_this)) {
+                    _args[1] = wrapListener(listener, _this);
+                }
+                return _target.apply(_this, _args);
+            });
+        }
+
+        const onmessageDesc =
+            Object.getOwnPropertyDescriptor(MediaKeySession.prototype, "onmessage") ||
+            Object.getOwnPropertyDescriptor(EventTarget.prototype, "onmessage");
+
+        Object.defineProperty(MediaKeySession.prototype, "onmessage", {
+            configurable: true,
+            enumerable: true,
+            get: function () {
+                if (onmessageDesc && onmessageDesc.get)
+                    return onmessageDesc.get.call(this);
+                return this.__wvp2_onmessage;
+            },
+            set: function (listener) {
+                const wrapped = wrapListener(listener, this);
+                this.__wvp2_onmessage = wrapped;
+                if (onmessageDesc && onmessageDesc.set)
+                    onmessageDesc.set.call(this, wrapped);
+            }
+        });
     }
 
-    Util.proxy(MediaKeySession.prototype, "update", (_target, _this, _args) => {
-        if (_this == null || !(_this instanceof MediaKeySession)) {
+    Util.proxy(MediaKeySession.prototype, "update", async (_target, _this, _args) => {
+        if (_this == null) {
             return _target.apply(_this, _args);
         }
 
         try {
-            parseClearKeyResponse(_args[0]);
+            await handleLicenseUpdate(_args[0], _this);
         } catch (e) {
-            parseWidevineChallenge(_args[0], _this);
+            Util.emit("EME_LICENSE", {
+                success: false,
+                args: e?.message || String(e)
+            });
         }
 
         try {
-            return _target.apply(_this, _args);
+            return await _target.apply(_this, _args);
         } catch (e) {
-            // ignored, since this will always fail
+            // ignored, since this will always fail on the browser CDM
         }
     });
 }
