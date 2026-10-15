@@ -319,20 +319,34 @@ async function handleLicenseUpdate(license, mediaKeySession) {
     await parseWidevineChallenge(bytes, mediaKeySession);
 }
 
+function isPlayReadyLicenseText(text) {
+    return /PlayReady|DRM\/2007\/03\/protocols|microsoft\.com\/DRM|LicenseNonce|SigningCertificateChain/i.test(text);
+}
+
 async function parseWidevineChallenge(license, mediaKeySession) {
     const originalBytes = new Uint8Array(license);
+    let originalText = "";
+    try {
+        originalText = new TextDecoder("utf-8", { fatal: false }).decode(originalBytes).trim();
+    } catch (e) {}
+
+    if (originalText.startsWith("<") && isPlayReadyLicenseText(originalText)) {
+        console.warn("[WVP2]", frameId, "PlayReady SOAP license ignored (not Widevine)");
+        Util.emit("EME_LICENSE", {
+            success: false,
+            args: "PlayReady SOAP license (AcquireLicenseResponse), not Widevine. WVP2 cannot extract PlayReady keys. PlayReady EME is blocked so the player can fall back to Widevine if the stream supports it."
+        });
+        return;
+    }
+
     const decoded = tryDecodeSignedMessage(originalBytes);
 
     if (!decoded) {
         const preview = previewBytes(originalBytes);
         let extra = "";
-        try {
-            const text = new TextDecoder("utf-8", { fatal: false }).decode(originalBytes).trim();
-            if (text.startsWith("<")) {
-                const playready = /PlayReady|DRM\/2007\/03\/protocols|microsoft\.com\/DRM/i.test(text);
-                extra = ` SOAP tags[${xmlTagSummary(text).join(",")}] playready=${playready} xmlCandidates=${extractXmlLicenseValues(text).length}`;
-            }
-        } catch (e) {}
+        if (originalText.startsWith("<")) {
+            extra = ` SOAP tags[${xmlTagSummary(originalText).join(",")}] xmlCandidates=${extractXmlLicenseValues(originalText).length}`;
+        }
         console.warn("[WVP2]", frameId, "License decode failed", preview, extra);
         Util.emit("EME_LICENSE", {
             success: false,
@@ -494,6 +508,20 @@ function parseClearKeyResponse(license) {
         type: "CLEARKEY",
         url: window.location.href,
         title: document.title
+    });
+}
+
+if (typeof Navigator !== "undefined" && Navigator.prototype.requestMediaKeySystemAccess) {
+    Util.proxy(Navigator.prototype, "requestMediaKeySystemAccess", (_target, _this, _args) => {
+        const keySystem = String(_args[0] || "");
+        if (/playready/i.test(keySystem)) {
+            console.log("[WVP2]", frameId, "Blocking PlayReady key system:", keySystem);
+            return Promise.reject(new DOMException(
+                "PlayReady blocked by WidevineProxy2 so the player can use Widevine",
+                "NotSupportedError"
+            ));
+        }
+        return _target.apply(_this, _args);
     });
 }
 
