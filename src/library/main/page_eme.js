@@ -117,7 +117,30 @@ function decodeMaybeHex(str) {
     return out;
 }
 
-function extractXmlLicenseValues(text) {
+function longestBase64Blob(str) {
+    const compact = String(str).replace(/\s+/g, "");
+    const re = /[A-Za-z0-9+/_-]{32,}={0,3}/g;
+    let best = "";
+    let match;
+    while ((match = re.exec(compact))) {
+        if (match[0].length > best.length)
+            best = match[0];
+    }
+    return best || null;
+}
+
+function xmlTagSummary(text) {
+    const tags = [];
+    const re = /<\/?([A-Za-z0-9:._-]+)/g;
+    let match;
+    while ((match = re.exec(text)) && tags.length < 16) {
+        if (!tags.includes(match[1]))
+            tags.push(match[1]);
+    }
+    return tags;
+}
+
+function extractXmlLicenseValues(text, depth = 0) {
     const out = [];
     const seen = new Set();
     const pushText = (value) => {
@@ -128,26 +151,30 @@ function extractXmlLicenseValues(text) {
             return;
         seen.add(trimmed);
         out.push(trimmed);
+        const blob = longestBase64Blob(trimmed);
+        if (blob && blob !== trimmed)
+            pushText(blob);
+        if (depth < 2 && trimmed.startsWith("<") && trimmed !== text)
+            extractXmlLicenseValues(trimmed, depth + 1).forEach(pushText);
     };
+
+    const preferred = [
+        "acquirelicenseresult", "license", "licenseresponse", "licensedata",
+        "license_data", "binary", "response", "body", "license_response",
+        "widevinelicense", "widevine", "challenge", "message"
+    ];
 
     if (typeof DOMParser !== "undefined") {
         try {
             const doc = new DOMParser().parseFromString(text, "text/xml");
-            const preferred = [
-                "AcquireLicenseResult", "License", "LicenseResponse", "license",
-                "licenseData", "license_data", "Binary", "Response", "Body",
-                "license_response", "WidevineLicense", "widevine"
-            ];
-            for (const name of preferred) {
-                const nodes = doc.getElementsByTagName(name);
-                for (const node of nodes)
-                    pushText(node.textContent);
-            }
             const all = doc.getElementsByTagName("*");
             for (const node of all) {
-                if (node.childElementCount === 0)
+                const name = (node.localName || node.tagName || "").toLowerCase();
+                if (preferred.includes(name) || node.childElementCount === 0)
                     pushText(node.textContent);
             }
+            if (doc.documentElement)
+                pushText(doc.documentElement.textContent);
         } catch (e) {}
     }
 
@@ -156,10 +183,14 @@ function extractXmlLicenseValues(text) {
     while ((cdataMatch = cdataRe.exec(text)))
         pushText(cdataMatch[1]);
 
-    const b64Re = /[A-Za-z0-9+/_-]{64,}={0,2}/g;
-    let b64Match;
-    while ((b64Match = b64Re.exec(text)))
-        pushText(b64Match[0]);
+    const wrappedB64Re = /(?:[A-Za-z0-9+/_-]{4}\s*){8,}={0,3}/g;
+    let wrappedMatch;
+    while ((wrappedMatch = wrappedB64Re.exec(text)))
+        pushText(wrappedMatch[0].replace(/\s+/g, ""));
+
+    const blob = longestBase64Blob(text.replace(/<[^>]+>/g, " "));
+    if (blob)
+        pushText(blob);
 
     return out;
 }
@@ -237,7 +268,11 @@ function unwrapLicenseCandidates(bytes) {
             }
         } else if (text.startsWith("<")) {
             const found = extractXmlLicenseValues(text);
-            console.log("[WVP2]", "SOAP/XML license wrapper, candidates:", found.length);
+            console.log("[WVP2]", "SOAP/XML license wrapper", {
+                candidates: found.length,
+                tags: xmlTagSummary(text),
+                head: text.slice(0, 400)
+            });
             for (const item of found) {
                 try {
                     push(decodeMaybeB64(item));
@@ -290,10 +325,18 @@ async function parseWidevineChallenge(license, mediaKeySession) {
 
     if (!decoded) {
         const preview = previewBytes(originalBytes);
-        console.warn("[WVP2]", frameId, "License decode failed", preview);
+        let extra = "";
+        try {
+            const text = new TextDecoder("utf-8", { fatal: false }).decode(originalBytes).trim();
+            if (text.startsWith("<")) {
+                const playready = /PlayReady|DRM\/2007\/03\/protocols|microsoft\.com\/DRM/i.test(text);
+                extra = ` SOAP tags[${xmlTagSummary(text).join(",")}] playready=${playready} xmlCandidates=${extractXmlLicenseValues(text).length}`;
+            }
+        } catch (e) {}
+        console.warn("[WVP2]", frameId, "License decode failed", preview, extra);
         Util.emit("EME_LICENSE", {
             success: false,
-            args: "Failed to decode license: invalid protobuf/wrapper. " + preview
+            args: "Failed to decode license: invalid protobuf/wrapper. " + preview + extra
         });
         return;
     }
