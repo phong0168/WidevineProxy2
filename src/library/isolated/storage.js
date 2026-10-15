@@ -98,6 +98,27 @@ onMessage("SETTINGS", async _ => {
     }
 });
 
+async function attachManifestToStoredKeys(pageUrl, manifest) {
+    if (!pageUrl || !manifest || !manifest.url)
+        return;
+
+    const all = await chrome.storage.local.get(null);
+    const patch = {};
+    for (const [key, entry] of Object.entries(all)) {
+        if (!entry || typeof entry !== "object" || entry.url !== pageUrl)
+            continue;
+        const mans = Array.isArray(entry.manifests) ? entry.manifests : [];
+        if (mans.some((m) => m && m.url === manifest.url))
+            continue;
+        const next = { ...manifest };
+        if (manifestHeaders.has(next.url))
+            next.headers = manifestHeaders.get(next.url);
+        patch[key] = { ...entry, manifests: mans.concat(next) };
+    }
+    if (Object.keys(patch).length)
+        await chrome.storage.local.set(patch);
+}
+
 onMessage("MANIFEST_URL", async (data) => {
     const { url, tab_url } = data;
     delete data.tab_url;
@@ -113,6 +134,8 @@ onMessage("MANIFEST_URL", async (data) => {
             manifestUrls.set(tab_url, elements);
         }
     }
+
+    await attachManifestToStoredKeys(tab_url, data);
 })
 
 onMessage("KEYS", async (data) => {

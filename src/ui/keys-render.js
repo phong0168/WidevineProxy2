@@ -20,6 +20,12 @@ export function manifests(entry) {
     return (entry && entry.manifests) || [];
 }
 
+export function preferredManifestIndex(entry) {
+    const mans = manifests(entry);
+    const mix2 = mans.findIndex((m) => /mix-stream2\.mpd(?:$|[?#])/i.test(m.url || ""));
+    return mix2 >= 0 ? mix2 : 0;
+}
+
 export function keyLines(entry) {
     return ((entry && entry.keys) || []).map((k) =>
         typeof k === "string" ? k : k.kid + ":" + k.k
@@ -75,7 +81,8 @@ export function buildCommand(entry, settings, manifestIndex) {
     const single = !!settings.use_single_quotes; // bash prefers single quotes
     const q = (s) => shellQuote(s, single);
     const mans = manifests(entry);
-    const manifest = mans[manifestIndex || 0] || mans[0] || {};
+    const idx = manifestIndex == null ? preferredManifestIndex(entry) : manifestIndex;
+    const manifest = mans[idx] || mans[0] || {};
     const url = manifest.url || "";
 
     const parts = [exe];
@@ -219,15 +226,17 @@ export function renderKeyEntry(entry, settings, onDelete) {
     if (mans.length) {
         const sel = document.createElement("select");
         sel.className = "kv-select";
+        const preferred = preferredManifestIndex(entry);
         mans.forEach((m, i) => {
             const o = document.createElement("option");
             o.value = String(i);
             o.textContent = normalizeType(m.type) + " · " + (m.url || "");
             sel.append(o);
         });
+        sel.value = String(preferred);
         body.append(kvRow("Manifest", sel, () => mans[Number(sel.value)].url || ""));
 
-        const cmdInput = inputVal(buildCommand(entry, settings, 0));
+        const cmdInput = inputVal(buildCommand(entry, settings, preferred));
         body.append(kvRow("Command", cmdInput, () => cmdInput.value));
 
         // Re-write the command whenever the manifest OR settings change.

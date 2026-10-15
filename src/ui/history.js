@@ -1,4 +1,4 @@
-import { renderKeyEntry, entriesFromMap, normalizeType, manifests, searchText } from "./keys-render.js";
+import { renderKeyEntry, entriesFromMap, normalizeType, manifests, preferredManifestIndex, searchText } from "./keys-render.js";
 
 const root = document.documentElement;
 const listEl = document.getElementById("history-list");
@@ -19,7 +19,7 @@ let query = "";
 let typeFilter = "all";
 
 function matches(entry) {
-    const type = normalizeType((manifests(entry)[0] || {}).type);
+    const type = normalizeType((manifests(entry)[preferredManifestIndex(entry)] || manifests(entry)[0] || {}).type);
     if (typeFilter !== "all" && type !== typeFilter)
         return false;
     return !(query && searchText(entry).indexOf(query) === -1);
