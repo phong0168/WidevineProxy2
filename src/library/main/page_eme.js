@@ -107,6 +107,63 @@ function looksLikeJson(bytes) {
     return bytes[i] === 0x7b || bytes[i] === 0x5b;
 }
 
+function decodeMaybeHex(str) {
+    const hex = String(str).replace(/\s+/g, "");
+    if (hex.length < 32 || hex.length % 2 !== 0 || /[^0-9a-fA-F]/.test(hex))
+        return null;
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i++)
+        out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    return out;
+}
+
+function extractXmlLicenseValues(text) {
+    const out = [];
+    const seen = new Set();
+    const pushText = (value) => {
+        if (value == null)
+            return;
+        const trimmed = String(value).trim();
+        if (trimmed.length < 16 || seen.has(trimmed))
+            return;
+        seen.add(trimmed);
+        out.push(trimmed);
+    };
+
+    if (typeof DOMParser !== "undefined") {
+        try {
+            const doc = new DOMParser().parseFromString(text, "text/xml");
+            const preferred = [
+                "AcquireLicenseResult", "License", "LicenseResponse", "license",
+                "licenseData", "license_data", "Binary", "Response", "Body",
+                "license_response", "WidevineLicense", "widevine"
+            ];
+            for (const name of preferred) {
+                const nodes = doc.getElementsByTagName(name);
+                for (const node of nodes)
+                    pushText(node.textContent);
+            }
+            const all = doc.getElementsByTagName("*");
+            for (const node of all) {
+                if (node.childElementCount === 0)
+                    pushText(node.textContent);
+            }
+        } catch (e) {}
+    }
+
+    const cdataRe = /<!\[CDATA\[([\s\S]*?)\]\]>/gi;
+    let cdataMatch;
+    while ((cdataMatch = cdataRe.exec(text)))
+        pushText(cdataMatch[1]);
+
+    const b64Re = /[A-Za-z0-9+/_-]{64,}={0,2}/g;
+    let b64Match;
+    while ((b64Match = b64Re.exec(text)))
+        pushText(b64Match[0]);
+
+    return out;
+}
+
 function collectJsonLicenseValues(obj, out = [], seen = new Set()) {
     if (obj == null)
         return out;
@@ -177,6 +234,17 @@ function unwrapLicenseCandidates(bytes) {
                         push(decodeMaybeB64(item));
                     } catch (e) {}
                 }
+            }
+        } else if (text.startsWith("<")) {
+            const found = extractXmlLicenseValues(text);
+            console.log("[WVP2]", "SOAP/XML license wrapper, candidates:", found.length);
+            for (const item of found) {
+                try {
+                    push(decodeMaybeB64(item));
+                } catch (e) {}
+                const hex = decodeMaybeHex(item);
+                if (hex)
+                    push(hex);
             }
         } else if (/^[A-Za-z0-9+/_=-]{16,}$/.test(text.replace(/\s+/g, ""))) {
             try {
