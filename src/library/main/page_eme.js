@@ -67,17 +67,142 @@ async function bufferToUint8Array(data) {
     if (data instanceof ArrayBuffer)
         return new Uint8Array(data);
     if (data instanceof Uint8Array)
-        return data;
+        return data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
+            ? data
+            : new Uint8Array(data);
     if (ArrayBuffer.isView(data))
         return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     if (typeof data === "string") {
+        const trimmed = data.trim();
         try {
-            return Util.b64.decode(data);
+            return decodeMaybeB64(trimmed);
         } catch (e) {
-            return Util.utf8.encode(data);
+            return Util.utf8.encode(trimmed);
         }
     }
     return new Uint8Array(data);
+}
+
+function decodeMaybeB64(str) {
+    const cleaned = String(str).replace(/-/g, "+").replace(/_/g, "/").replace(/\s+/g, "");
+    const padded = cleaned.length % 4 === 0 ? cleaned : cleaned + "=".repeat(4 - (cleaned.length % 4));
+    return Util.b64.decode(padded);
+}
+
+function previewBytes(bytes) {
+    const head = Array.from(bytes.subarray(0, 16))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(" ");
+    let ascii = "";
+    try {
+        ascii = new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, 48)).replace(/[^\x20-\x7e]/g, ".");
+    } catch (e) {}
+    return `len=${bytes.length} hex[${head}] ascii[${ascii}]`;
+}
+
+function looksLikeJson(bytes) {
+    let i = 0;
+    while (i < bytes.length && (bytes[i] === 0x20 || bytes[i] === 0x09 || bytes[i] === 0x0a || bytes[i] === 0x0d))
+        i++;
+    return bytes[i] === 0x7b || bytes[i] === 0x5b;
+}
+
+function collectJsonLicenseValues(obj, out = [], seen = new Set()) {
+    if (obj == null)
+        return out;
+    if (typeof obj === "string") {
+        if (obj.length > 8)
+            out.push(obj);
+        return out;
+    }
+    if (typeof obj !== "object")
+        return out;
+    if (seen.has(obj))
+        return out;
+    seen.add(obj);
+
+    if (Array.isArray(obj)) {
+        if (obj.length && obj.every((n) => typeof n === "number"))
+            out.push(Uint8Array.from(obj));
+        else
+            obj.forEach((v) => collectJsonLicenseValues(v, out, seen));
+        return out;
+    }
+
+    const preferred = [
+        "license", "payload", "licenseData", "license_data", "licenseResponse",
+        "license_response", "ckc", "message", "response", "data", "body",
+        "widevine", "widevineLicense", "signedResponse", "license_b64"
+    ];
+    for (const key of preferred) {
+        if (Object.prototype.hasOwnProperty.call(obj, key))
+            collectJsonLicenseValues(obj[key], out, seen);
+    }
+    for (const value of Object.values(obj))
+        collectJsonLicenseValues(value, out, seen);
+    return out;
+}
+
+function unwrapLicenseCandidates(bytes) {
+    const candidates = [bytes];
+    const push = (buf) => {
+        if (buf && buf.length)
+            candidates.push(buf);
+    };
+
+    if (bytes.length > 4) {
+        const rest = bytes.subarray(4);
+        const be = ((bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3]) >>> 0;
+        const le = (bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) >>> 0;
+        if (be === rest.length || be === bytes.length - 4)
+            push(rest);
+        else if (be > 0 && be < rest.length)
+            push(rest.subarray(0, be));
+        if (le === rest.length || le === bytes.length - 4)
+            push(rest);
+        else if (le > 0 && le < rest.length)
+            push(rest.subarray(0, le));
+    }
+
+    try {
+        const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes).replace(/^\uFEFF/, "").trim();
+        if (text.startsWith("{") || text.startsWith("[")) {
+            const found = [];
+            collectJsonLicenseValues(JSON.parse(text), found);
+            for (const item of found) {
+                if (item instanceof Uint8Array) {
+                    push(item);
+                } else if (typeof item === "string") {
+                    try {
+                        push(decodeMaybeB64(item));
+                    } catch (e) {}
+                }
+            }
+        } else if (/^[A-Za-z0-9+/_=-]{16,}$/.test(text.replace(/\s+/g, ""))) {
+            try {
+                push(decodeMaybeB64(text));
+            } catch (e) {}
+        }
+    } catch (e) {}
+
+    return candidates;
+}
+
+function tryDecodeSignedMessage(bytes) {
+    const fallbacks = [];
+    for (const candidate of unwrapLicenseCandidates(bytes)) {
+        try {
+            const signedMessage = SignedMessage.decode(candidate);
+            if (
+                signedMessage.type === SignedMessage.MessageType.LICENSE ||
+                signedMessage.type === SignedMessage.MessageType.SERVICE_CERTIFICATE
+            ) {
+                return { signedMessage, bytes: candidate };
+            }
+            fallbacks.push({ signedMessage, bytes: candidate });
+        } catch (e) {}
+    }
+    return fallbacks[0] || null;
 }
 
 async function handleLicenseUpdate(license, mediaKeySession) {
@@ -92,19 +217,21 @@ async function handleLicenseUpdate(license, mediaKeySession) {
 }
 
 async function parseWidevineChallenge(license, mediaKeySession) {
-    const licenseBytes = new Uint8Array(license);
+    const originalBytes = new Uint8Array(license);
+    const decoded = tryDecodeSignedMessage(originalBytes);
 
-    let signedMessage;
-
-    try {
-        signedMessage = SignedMessage.decode(licenseBytes);
-    } catch (e) {
+    if (!decoded) {
+        const preview = previewBytes(originalBytes);
+        console.warn("[WVP2]", frameId, "License decode failed", preview);
         Util.emit("EME_LICENSE", {
             success: false,
-            args: "Failed to decode license: " + (e?.message || String(e))
+            args: "Failed to decode license: invalid protobuf/wrapper. " + preview
         });
         return;
     }
+
+    const signedMessage = decoded.signedMessage;
+    const licenseBytes = decoded.bytes;
 
     if (signedMessage.type === SignedMessage.MessageType.LICENSE) {
         Util.emit("EME_LICENSE", {
@@ -112,7 +239,13 @@ async function parseWidevineChallenge(license, mediaKeySession) {
             args: Util.safeStringify([license])
         });
 
-        const licenseObj = License.decode(signedMessage.msg);
+        let licenseObj;
+        try {
+            licenseObj = License.decode(signedMessage.msg);
+        } catch (e) {
+            console.error("[WVP2]", frameId, "LICENSE body decode failed", e);
+            return;
+        }
         const requestId = Util.b64.encode(licenseObj.id.requestId);
 
         if (!cdmSessions.has(requestId))
@@ -123,15 +256,20 @@ async function parseWidevineChallenge(license, mediaKeySession) {
         let keys;
         let psshData;
 
-        if (session.remote) {
-            keys = await Util.emit("REMOTE_PARSE", {
-                sessionId: session.sessionId,
-                license: Util.b64.encode(licenseBytes)
-            });
-            psshData = session.psshData;
-        } else {
-            keys = session.parseLicense(licenseBytes);
-            psshData = Util.b64.encode(session.getPsshData());
+        try {
+            if (session.remote) {
+                keys = await Util.emit("REMOTE_PARSE", {
+                    sessionId: session.sessionId,
+                    license: Util.b64.encode(licenseBytes)
+                });
+                psshData = session.psshData;
+            } else {
+                keys = session.parseLicense(licenseBytes);
+                psshData = Util.b64.encode(session.getPsshData());
+            }
+        } catch (e) {
+            console.error("[WVP2]", frameId, "Parse license keys failed", e);
+            return;
         }
 
         console.log("[WVP2]", frameId, "Widevine Keys", keys);
@@ -212,6 +350,8 @@ async function getLicenseChallengeRemote(licenseRequest, serverCert) {
 function parseClearKeyResponse(license) {
     const text = new TextDecoder().decode(new Uint8Array(license));
     const clearKey = JSON.parse(text);
+    if (!clearKey || !Array.isArray(clearKey.keys))
+        throw new Error("not ClearKey");
 
     Util.emit("EME_LICENSE", {
         success: true,
