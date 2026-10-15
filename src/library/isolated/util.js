@@ -10,6 +10,17 @@ export class Util {
         return typeof url === "string" && /mix-stream2\.mpd(?:$|[?#])/i.test(url);
     }
 
+    static mixStream2Key(url) {
+        if (!url)
+            return "";
+        try {
+            const parsed = new URL(url);
+            return parsed.origin + parsed.pathname.replace(/\/+$/, "");
+        } catch (e) {
+            return String(url).split("?")[0].split("#")[0];
+        }
+    }
+
     static readWidevineDevice(b64Data) {
         const data = Util.b64.decode(b64Data);
         const deviceType = data[4];

@@ -54,6 +54,10 @@ async function parseWidevineChallenge(license, mediaKeySession) {
     try {
         signedMessage = SignedMessage.decode(licenseBytes);
     } catch (e) {
+        Util.emit("EME_LICENSE", {
+            success: false,
+            args: "Failed to decode license: " + (e?.message || String(e))
+        });
         return;
     }
 
@@ -101,6 +105,11 @@ async function parseWidevineChallenge(license, mediaKeySession) {
         const serverCert = new Uint8Array(signedMessage.msg);
         console.log("[WVP2]", frameId, "Server Cert (message):", parseServerCert(serverCert));
         sessionServerCertMap.set(mediaKeySession, serverCert);
+    } else {
+        Util.emit("EME_LICENSE", {
+            success: false,
+            args: "Unexpected SignedMessage type: " + signedMessage.type
+        });
     }
 }
 

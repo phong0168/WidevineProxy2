@@ -5,12 +5,21 @@ const manifestUrls = new Map();
 const manifestHeaders = new Map();
 const emeStatuses = {};
 const seenMixStream2Urls = new Set();
+const EME_HANDSHAKE_START = new Set([
+    "EME_CREATE_MEDIA_KEYS",
+    "EME_CREATE_SESSION",
+    "EME_GENERATE_REQUEST",
+    "EME_LICENSE_REQUEST",
+]);
+
+let pendingDrmReset = false;
+let pendingDrmResetUrl = null;
 
 function resetEmeStatuses(url) {
     for (const key of Object.keys(emeStatuses)) {
         delete emeStatuses[key];
     }
-    console.log("[WVP2]", "mix-stream2.mpd captured, resetting DRM status", url);
+    console.log("[WVP2]", "Resetting DRM status for mix-stream2.mpd handshake", url);
     try {
         chrome.runtime.sendMessage({
             type: "EME_STATUS_RESET",
@@ -23,11 +32,26 @@ function resetEmeStatuses(url) {
     }
 }
 
-function maybeResetDrmStatus(url) {
-    if (!Util.isMixStream2Url(url) || seenMixStream2Urls.has(url))
+function armDrmReset(url) {
+    if (!Util.isMixStream2Url(url))
         return;
-    seenMixStream2Urls.add(url);
-    resetEmeStatuses(url);
+
+    const key = Util.mixStream2Key(url);
+    if (!key || seenMixStream2Urls.has(key))
+        return;
+
+    seenMixStream2Urls.add(key);
+    pendingDrmReset = true;
+    pendingDrmResetUrl = url;
+    console.log("[WVP2]", "mix-stream2.mpd captured, DRM status will reset on next EME handshake", url);
+}
+
+function consumePendingDrmReset() {
+    if (!pendingDrmReset)
+        return;
+    pendingDrmReset = false;
+    resetEmeStatuses(pendingDrmResetUrl);
+    pendingDrmResetUrl = null;
 }
 
 function onMessage(type, handler) {
@@ -78,7 +102,7 @@ onMessage("MANIFEST_URL", async (data) => {
     const { url, tab_url } = data;
     delete data.tab_url;
 
-    maybeResetDrmStatus(url);
+    armDrmReset(url);
 
     if (!manifestUrls.has(tab_url)) {
         manifestUrls.set(tab_url, [data]);
@@ -113,6 +137,8 @@ onMessage("KEYS", async (data) => {
 
 function onEmeStatusMessage(type) {
     onMessage(type, (data) => {
+        if (EME_HANDSHAKE_START.has(type))
+            consumePendingDrmReset();
         emeStatuses[type] = data;
         chrome.runtime.sendMessage({
             type: "EME_STATUS_REACTIVE",
@@ -171,7 +197,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "MANIFEST_HEADERS") {
         const { url, headers } = message.payload;
         manifestHeaders.set(url, headers);
-        maybeResetDrmStatus(url);
+        armDrmReset(url);
     } else if (message.type === "EME_STATUS_ACTIVE") {
         if (Object.keys(emeStatuses).length > 0) {
             sendResponse(emeStatuses);
